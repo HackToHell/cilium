@@ -286,6 +286,49 @@ int sock4_xlate(struct bpf_sock_addr *ctx)
 	return SYS_PROCEED;
 }
 
+#ifdef ENABLE_NODEPORT
+__section("post-bind-sock4")
+int sock4_post_bind(struct bpf_sock *ctx)
+{
+	struct lb4_service *svc;
+	struct lb4_key key = {
+		.address	= ctx->src_ip4,
+		.dport		= bpf_htons(ctx->src_port),
+	};
+
+	if (!sock_proto_enabled(ctx->protocol))
+		return SYS_PROCEED;
+
+	svc = __lb4_lookup_service(&key);
+
+	if (!svc) {
+		/* The k8s watcher installs service frontends for known
+		 * node addresses. If we have not found a service, the
+		 * only remaining overlap might be with the loopback
+		 * address, for which we perform a wildcard lookup.
+		 */
+		if (is_v4_loopback(key.address) &&
+			ctx->src_port >= NODEPORT_PORT_MIN &&
+			ctx->src_port <= NODEPORT_PORT_MAX) {
+
+			key.address = 0;
+			key.dport = bpf_htons(ctx->src_port);
+			svc = __lb4_lookup_service(&key);
+		}
+	}
+
+	if (svc && (lb4_svc_is_nodeport(svc) || lb4_svc_is_external_ip(svc))) {
+		/* The sockaddr of this socket overlaps with a NodePort
+		 * or ExternalIP service. We must reject this bind() call
+		 * to avoid accidentally hijacking its traffic.
+		 */
+		return SYS_REJECT;
+	}
+
+	return SYS_PROCEED;
+}
+#endif /* ENABLE_NODEPORT */
+
 #ifdef ENABLE_HOST_SERVICES_UDP
 __section("snd-sock4")
 int sock4_xlate_snd(struct bpf_sock_addr *ctx)
@@ -436,6 +479,17 @@ static __always_inline void ctx_get_v6_address(struct bpf_sock_addr *ctx,
 	addr->p4 = ctx->user_ip6[3];
 }
 
+#ifdef ENABLE_NODEPORT
+static __always_inline void ctx_get_v6_src_address(struct bpf_sock *ctx,
+					       union v6addr *addr)
+{
+	addr->p1 = ctx->src_ip6[0];
+	addr->p2 = ctx->src_ip6[1];
+	addr->p3 = ctx->src_ip6[2];
+	addr->p4 = ctx->src_ip6[3];
+}
+#endif /* ENABLE_NODEPORT */
+
 static __always_inline void ctx_set_v6_address(struct bpf_sock_addr *ctx,
 					       union v6addr *addr)
 {
@@ -496,6 +550,41 @@ out_fill_addr:
 	ctx_get_v6_address(ctx, &key->address);
 #endif /* ENABLE_NODEPORT */
 }
+
+#ifdef ENABLE_NODEPORT
+__section("post-bind-sock6")
+int sock6_post_bind(struct bpf_sock *ctx)
+{
+	struct lb6_service *svc;
+	struct lb6_key key = {
+		.dport		= bpf_htons(ctx->src_port),
+	};
+
+	if (!sock_proto_enabled(ctx->protocol))
+		return SYS_PROCEED;
+
+	ctx_get_v6_src_address(ctx, &key.address);
+
+	svc = __lb6_lookup_service(&key);
+
+	if (!svc) {
+		if (is_v6_loopback(&key.address) &&
+			ctx->src_port >= NODEPORT_PORT_MIN &&
+			ctx->src_port <= NODEPORT_PORT_MAX) {
+
+			__builtin_memset(&key.address, 0, sizeof(key.address));
+			key.dport = bpf_htons(ctx->src_port);
+			svc = __lb6_lookup_service(&key);
+		}
+	}
+
+	if (svc && (lb6_svc_is_nodeport(svc) || lb6_svc_is_external_ip(svc))) {
+		return SYS_REJECT;
+	}
+
+	return SYS_PROCEED;
+}
+#endif /* ENABLE_NODEPORT */
 
 __section("from-sock6")
 int sock6_xlate(struct bpf_sock_addr *ctx)
